@@ -1,14 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!--
-        Herencia del formulario del albarán de entrega.
-        Añade el widget delivery_lots_button como primera columna en la
-        lista de movimientos.
-
-        NOTA: En Odoo 19 la lista de operaciones usa move_ids (no
-        move_ids_without_package) y el tag es <list> en lugar de <tree>.
-        El xpath apunta al campo move_ids/list y posiciona antes de product_id.
-    -->
     <record id="view_picking_form_delivery_lots" model="ir.ui.view">
         <field name="name">stock.picking.form.delivery.lots</field>
         <field name="model">stock.picking</field>
