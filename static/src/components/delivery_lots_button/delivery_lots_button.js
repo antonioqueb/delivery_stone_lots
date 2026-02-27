@@ -88,22 +88,15 @@ export class DeliveryLotsButton extends Component {
         const moveId = this.getMoveId();
         if (!moveId) return;
         try {
-            // 1. Sincronizar en servidor
             await this.orm.call("stock.move", "action_update_quantity_from_lines", [moveId]);
 
-            // 2. Leer la cantidad actualizada del servidor
             const moveData = await this.orm.read("stock.move", [moveId], ["quantity", "product_uom_qty"]);
             if (!moveData.length) return;
 
             const newQty = moveData[0].quantity ?? moveData[0].product_uom_qty ?? 0;
 
-            // 3. Actualizar visualmente la celda de cantidad en la fila del move
-            //    sin recargar el modelo completo
             this._updateQuantityInDOM(newQty);
-
-            // 4. Si el record OWL tiene update, intentar parchear localmente
             this._patchRecordQuantity(newQty);
-
         } catch (e) {
             console.warn("[DLOTS] Error en _softSyncQuantity:", e);
         }
@@ -115,27 +108,21 @@ export class DeliveryLotsButton extends Component {
      */
     _updateQuantityInDOM(newQty) {
         try {
-            // Encontrar la fila <tr> que contiene este widget
             const btnEl = this.__owl__?.bdom?.el || this.el;
             if (!btnEl) return;
             const row = btnEl.closest?.("tr");
             if (!row) return;
 
-            // Buscar la celda del campo quantity o product_uom_qty
-            // Odoo usa el atributo name en el <td> o data-field
             const qtyCell = row.querySelector('td[name="quantity"] .o_field_widget, td[name="product_uom_qty"] .o_field_widget')
                 || row.querySelector('td.o_data_cell .o_field_float, td.o_data_cell .o_field_number');
 
             if (qtyCell) {
-                // Buscar el span o input dentro del widget
                 const span = qtyCell.querySelector('span, .o_field_float_toggle, .o_input');
                 if (span) {
                     span.textContent = newQty.toFixed(2);
                 }
             }
 
-            // Enfoque alternativo: buscar por data-tooltip-info o por contenido
-            // en caso de que la estructura DOM sea diferente
             row.querySelectorAll('td.o_data_cell').forEach((td) => {
                 const field = td.getAttribute('name');
                 if (field === 'quantity' || field === 'product_uom_qty') {
@@ -158,8 +145,6 @@ export class DeliveryLotsButton extends Component {
         try {
             const record = this.props.record;
             if (!record) return;
-
-            // Intentar actualizar via record.update (OWL record)
             if (record.data) {
                 if ('quantity' in record.data) {
                     record.data.quantity = newQty;
@@ -170,6 +155,23 @@ export class DeliveryLotsButton extends Component {
             }
         } catch (e) {
             console.warn("[DLOTS] _patchRecordQuantity falló (no crítico):", e);
+        }
+    }
+
+    /**
+     * Actualiza el badge del botón principal directamente en el DOM
+     * SIN tocar this.state (evita re-render OWL que colapsa la fila).
+     */
+    _updateButtonBadge(count) {
+        try {
+            const btnEl = this.__owl__?.bdom?.el || this.el;
+            if (!btnEl) return;
+            const badge = btnEl.querySelector(".badge, .dlots-count, [data-lot-count]");
+            if (badge) {
+                badge.textContent = count;
+            }
+        } catch (e) {
+            console.warn("[DLOTS] _updateButtonBadge:", e);
         }
     }
 
@@ -410,10 +412,9 @@ export class DeliveryLotsButton extends Component {
     }
 
     /**
-     * Elimina un lote con animación suave:
-     * - Anima la fila saliendo
-     * - Elimina la move line en servidor
-     * - Actualiza totales in-place sin recargar nada
+     * Elimina un lote con animación suave.
+     * NO toca this.state para evitar re-render OWL que colapsa la fila.
+     * Actualiza todo directamente en el DOM.
      */
     async removeLot(lotId) {
         const moveId = this.getMoveId();
@@ -423,7 +424,6 @@ export class DeliveryLotsButton extends Component {
         const row = this._detailsRow?.querySelector(`tr[data-lot-row="${lotId}"]`);
         let removedQty = 0;
         if (row) {
-            // Capturar la cantidad de esta fila antes de animarla
             const qtyCells = row.querySelectorAll("td.col-num.fw-semibold");
             if (qtyCells.length) {
                 removedQty = parseFloat(qtyCells[0].textContent) || 0;
@@ -456,13 +456,14 @@ export class DeliveryLotsButton extends Component {
             // 5. Sincronizar cantidad del move en servidor y actualizar DOM
             await this._softSyncQuantity();
 
-            // 6. Actualizar el badge del botón
-            await this._refreshCount();
+            // 6. Actualizar el badge del botón SIN tocar this.state
+            const tbody = this._detailsRow?.querySelector(".dlots-sel-table tbody");
+            const newCount = tbody ? tbody.children.length : 0;
+            this._updateButtonBadge(newCount);
 
             // 7. Si ya no hay filas, mostrar el mensaje vacío
-            const tbody = this._detailsRow?.querySelector(".dlots-sel-table tbody");
-            if (tbody && tbody.children.length === 0) {
-                const body = this._detailsRow.querySelector(".dlots-selected-body");
+            if (newCount === 0) {
+                const body = this._detailsRow?.querySelector(".dlots-selected-body");
                 if (body) {
                     body.innerHTML = `
                         <div class="dlots-no-selection">
@@ -473,7 +474,6 @@ export class DeliveryLotsButton extends Component {
             }
         } catch (err) {
             console.error("[DLOTS] Error eliminando lote:", err);
-            // Si falló, re-renderizar la tabla para estado consistente
             await this.refreshSelectedTable();
         }
     }
@@ -485,7 +485,6 @@ export class DeliveryLotsButton extends Component {
     _updateSelectedTotals(removedQty) {
         if (!this._detailsRow) return;
 
-        // Actualizar conteo en el footer
         const countEl = this._detailsRow.querySelector(".dlots-total-count");
         const qtyEl = this._detailsRow.querySelector(".dlots-total-qty");
         const badge = this._detailsRow.querySelector(".dlots-sel-badge");
@@ -502,7 +501,6 @@ export class DeliveryLotsButton extends Component {
             qtyEl.textContent = newTotal.toFixed(2);
         }
 
-        // Actualizar texto del footer (singular/plural)
         const footerTd = this._detailsRow.querySelector(".dlots-total-row td:first-child");
         if (footerTd) {
             footerTd.innerHTML = `Total (<span class="dlots-total-count">${newCount}</span> placa${newCount !== 1 ? "s" : ""}):`;
@@ -880,7 +878,8 @@ export class DeliveryLotsButton extends Component {
                     }]);
                 }
 
-                // Sincronizar cantidad del move suavemente
+                // En confirm sí podemos tocar state porque la tabla
+                // se va a re-renderizar completa de todos modos
                 await this._softSyncQuantity();
                 await this._refreshCount();
                 await this.refreshSelectedTable();
