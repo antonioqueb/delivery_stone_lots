@@ -1,13 +1,4 @@
 /** @odoo-module */
-/**
- * delivery_lots_button.js — CORREGIDO
- *
- * Fixes aplicados:
- * 1. getMoveId() ahora lee correctamente el ID del registro en lista O2M
- * 2. Se agregó supportedTypes: ["boolean"] para que Odoo 19 renderice el campo
- * 3. Se corrigió el manejo del click para que no compita con el click del row
- * 4. Se mejoró _refreshCount para que use el ID del record directamente
- */
 import { registry } from "@web/core/registry";
 import { standardFieldProps } from "@web/views/fields/standard_field_props";
 import { Component, useState, onWillStart, onWillUpdateProps, onWillUnmount } from "@odoo/owl";
@@ -40,20 +31,12 @@ export class DeliveryLotsButton extends Component {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     getMoveId(props = this.props) {
-        // En lista O2M de Odoo 19, el ID puede estar en diferentes lugares
         const record = props?.record;
         if (!record) return null;
-        
-        // Opción 1: resId (registro guardado)
         if (record.resId && record.resId > 0) return record.resId;
-        
-        // Opción 2: data.id
         const dataId = record.data?.id;
         if (dataId && typeof dataId === 'number' && dataId > 0) return dataId;
-        
-        // Opción 3: id directamente
         if (record.id && typeof record.id === 'number' && record.id > 0) return record.id;
-        
         return null;
     }
 
@@ -95,6 +78,16 @@ export class DeliveryLotsButton extends Component {
         if (Array.isArray(p)) return p[0];
         if (p?.id) return p.id;
         return null;
+    }
+
+    async _reloadModel() {
+        try {
+            if (this.props.record?.model?.load) {
+                await this.props.record.model.load();
+            }
+        } catch (e) {
+            console.warn("[DLOTS] No se pudo recargar el modelo:", e);
+        }
     }
 
     async _refreshCount(props = this.props) {
@@ -163,14 +156,11 @@ export class DeliveryLotsButton extends Component {
         const moveId = this.getMoveId();
         if (!moveId) {
             console.warn("[DLOTS] No hay moveId disponible — ¿El picking está guardado?");
-            // Mostrar un tooltip o mensaje al usuario
             alert("Guarda el albarán antes de gestionar las placas.");
             return;
         }
 
-        // Cerrar cualquier otro expandido
         document.querySelectorAll(".dlots-selected-row").forEach((e) => e.remove());
-        // También cerrar filas de stone_line_list si existieran
         document.querySelectorAll(".stone-selected-row").forEach((e) => e.remove());
 
         const tr = ev.currentTarget.closest("tr");
@@ -340,7 +330,6 @@ export class DeliveryLotsButton extends Component {
         const moveId = this.getMoveId();
         if (!moveId) return;
         try {
-            // Eliminar directamente vía ORM (más confiable que record.update en lista picking)
             const lines = await this.orm.searchRead(
                 "stock.move.line",
                 [["move_id", "=", moveId], ["lot_id", "=", lotId]],
@@ -349,8 +338,10 @@ export class DeliveryLotsButton extends Component {
             if (lines.length) {
                 await this.orm.unlink("stock.move.line", lines.map((l) => l.id));
             }
+            // FIX #2: Refrescar count + tabla inline + recargar modelo para actualizar cantidad en la lista
             await this._refreshCount();
             await this.refreshSelectedTable();
+            await this._reloadModel();
         } catch (err) {
             console.error("[DLOTS] Error eliminando lote:", err);
         }
@@ -373,7 +364,7 @@ export class DeliveryLotsButton extends Component {
         }
     }
 
-    // ─── POPUP fullscreen (DOM puro en document.body) ─────────────────────────
+    // ─── POPUP fullscreen ─────────────────────────────────────────────────────
 
     async openPopup() {
         this.destroyPopup();
@@ -416,7 +407,7 @@ export class DeliveryLotsButton extends Component {
                     <div class="dlots-popup-header">
                         <div class="dlots-popup-title">
                             <i class="fa fa-th me-2"></i>
-                            Placas asignadas al movimiento
+                            Placas disponibles para entrega
                             <span class="dlots-popup-subtitle">${this.getProductName() ? "— " + this.getProductName() : ""}</span>
                         </div>
                         <div class="dlots-popup-header-actions">
@@ -615,6 +606,9 @@ export class DeliveryLotsButton extends Component {
             }
         };
 
+        // FIX #1: Llamar a search_stone_inventory_for_delivery (método de entrega),
+        // NO al método de ventas (search_stone_inventory_for_so).
+        // Esto permite mostrar TODO el inventario disponible sin restricciones del SO.
         const loadPage = async (page, reset) => {
             if (reset) {
                 state.isLoading = true;
@@ -631,36 +625,19 @@ export class DeliveryLotsButton extends Component {
             }
 
             try {
-                let result;
-                try {
-                    result = await this.orm.call(
-                        "stock.quant",
-                        "search_stone_inventory_for_so_paginated",
-                        [],
-                        {
-                            product_id: productId,
-                            filters: state.filters,
-                            current_lot_ids: Array.from(state.pendingIds),
-                            page,
-                            page_size: PAGE_SIZE,
-                        }
-                    );
-                } catch (_e) {
-                    const all = (await this.orm.call(
-                        "stock.quant",
-                        "search_stone_inventory_for_so",
-                        [],
-                        {
-                            product_id: productId,
-                            filters: state.filters,
-                            current_lot_ids: Array.from(state.pendingIds),
-                        }
-                    )) || [];
-                    result = {
-                        items: all.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
-                        total: all.length,
-                    };
-                }
+                const result = await this.orm.call(
+                    "stock.quant",
+                    "search_stone_inventory_for_delivery",
+                    [],
+                    {
+                        product_id: productId,
+                        filters: state.filters,
+                        current_lot_ids: Array.from(state.pendingIds),
+                        move_id: moveId,
+                        page,
+                        page_size: PAGE_SIZE,
+                    }
+                );
 
                 const items = result.items || [];
                 if (reset || page === 0) {
@@ -672,7 +649,7 @@ export class DeliveryLotsButton extends Component {
                 state.page = page;
                 state.hasMore = state.quants.length < state.totalCount;
             } catch (err) {
-                console.error("[DLOTS POPUP] Error:", err);
+                console.error("[DLOTS POPUP] Error llamando search_stone_inventory_for_delivery:", err);
                 body.innerHTML = `
                     <div class="dlots-empty-state">
                         <i class="fa fa-exclamation-triangle fa-2x text-danger"></i>
@@ -687,14 +664,13 @@ export class DeliveryLotsButton extends Component {
             renderTable();
         };
 
-        // ─── Confirmar: escribir directamente vía ORM (no record.update) ─────
+        // ─── Confirmar ────────────────────────────────────────────────────────
         const doConfirm = async () => {
             this.destroyPopup();
 
             if (!moveId) return;
 
             try {
-                // 1. Obtener líneas actuales del move
                 const currentLines = await this.orm.searchRead(
                     "stock.move.line",
                     [["move_id", "=", moveId]],
@@ -706,17 +682,14 @@ export class DeliveryLotsButton extends Component {
                 }
                 const currentLotIds = new Set(Object.keys(currentLotMap).map(Number));
 
-                // 2. Calcular cambios
                 const toAdd = [...state.pendingIds].filter((id) => !currentLotIds.has(id));
                 const toRemove = [...currentLotIds].filter((id) => !state.pendingIds.has(id));
 
-                // Eliminar los que se quitaron
                 if (toRemove.length) {
                     const idsToUnlink = toRemove.map((lotId) => currentLotMap[lotId]);
                     await this.orm.unlink("stock.move.line", idsToUnlink);
                 }
 
-                // Agregar los nuevos
                 for (const lotId of toAdd) {
                     let qty = 0;
                     let srcLocId = locationId;
@@ -750,11 +723,8 @@ export class DeliveryLotsButton extends Component {
 
                 await this._refreshCount();
                 await this.refreshSelectedTable();
-
-                // Recargar el picking para reflejar cambios en la vista
-                if (this.props.record?.model?.load) {
-                    await this.props.record.model.load();
-                }
+                // FIX #2: Recargar modelo para reflejar cantidad actualizada en la lista
+                await this._reloadModel();
 
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
@@ -774,7 +744,6 @@ export class DeliveryLotsButton extends Component {
         document.addEventListener("keydown", onKeyDown);
         this._popupKeyHandler = onKeyDown;
 
-        // Filtros
         const bindFilter = (id, key) => {
             const input = root.querySelector(`#${id}`);
             if (!input) return;
@@ -809,7 +778,6 @@ export class DeliveryLotsButton extends Component {
     }
 }
 
-// CRÍTICO: supportedTypes: ["boolean"] para que Odoo 19 acepte el widget en listas
 registry.category("fields").add("delivery_lots_button", {
     component: DeliveryLotsButton,
     displayName: "Botón Lotes Albarán",
