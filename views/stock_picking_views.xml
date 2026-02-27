@@ -6,13 +6,18 @@
         <field name="inherit_id" ref="stock.view_picking_form"/>
         <field name="arch" type="xml">
 
+            <!--
+                Mismo patrón que sale_stone_selection:
+                - Usamos un campo Boolean (is_dlots_expanded) como trigger del botón.
+                - El widget delivery_lots_button consulta los lotes vía ORM
+                  usando el resId del stock.move, NO depende de sub-records O2M.
+            -->
             <xpath expr="//field[@name='move_ids']/list/field[@name='product_id']" position="before">
                 <field
-                    name="move_line_ids"
+                    name="is_dlots_expanded"
                     widget="delivery_lots_button"
                     string=" "
                     nolabel="1"
-                    readonly="1"
                     class="p-0 text-center"
                 />
             </xpath>

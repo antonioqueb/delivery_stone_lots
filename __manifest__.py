@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Delivery Stone Lots Viewer',
-    'version': '19.0.1.0.0',
+    'version': '19.0.2.0.0',
     'category': 'Inventory',
-    'summary': 'Visualización de lotes (placas) asignados en el albarán de entrega',
+    'summary': 'Visualización y gestión de lotes (placas) en albarán de entrega',
     'author': 'Alphaqueb Consulting SAS',
     'website': 'https://alphaqueb.com',
     'depends': ['stock', 'stock_lot_dimensions'],
