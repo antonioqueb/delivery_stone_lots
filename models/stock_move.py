@@ -4,7 +4,6 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
-
 class StockMove(models.Model):
     _inherit = 'stock.move'
 
@@ -30,11 +29,56 @@ class StockMove(models.Model):
             else:
                 move.x_original_demand = 0.0
 
+    def action_set_delivery_lots(self, lot_ids):
+        """
+        Recibe los IDs exactos que deben quedar asignados a este movimiento.
+        Crea los faltantes, elimina los removidos y fuerza la sincronización.
+        """
+        self.ensure_one()
+        current_lines = self.move_line_ids.filtered(lambda l: l.lot_id)
+        current_lot_map = {line.lot_id.id: line for line in current_lines}
+        current_lot_ids = set(current_lot_map.keys())
+        new_lot_ids = set(lot_ids or [])
+
+        to_remove = current_lot_ids - new_lot_ids
+        to_add = new_lot_ids - current_lot_ids
+
+        # 1. Eliminar placas deseleccionadas
+        if to_remove:
+            lines_to_unlink = self.env['stock.move.line'].browse([current_lot_map[lid].id for lid in to_remove])
+            lines_to_unlink.unlink()
+
+        # 2. Agregar placas nuevas seleccionadas
+        if to_add:
+            lines_vals = []
+            for lot_id in to_add:
+                quant = self.env['stock.quant'].search([
+                    ('lot_id', '=', lot_id),
+                    ('product_id', '=', self.product_id.id),
+                    ('location_id.usage', '=', 'internal'),
+                    ('quantity', '>', 0)
+                ], limit=1)
+
+                qty = quant.quantity if quant else 0.0
+                loc_id = quant.location_id.id if quant else self.location_id.id
+
+                lines_vals.append({
+                    'move_id': self.id,
+                    'picking_id': self.picking_id.id,
+                    'product_id': self.product_id.id,
+                    'lot_id': lot_id,
+                    'quantity': qty,
+                    'location_id': loc_id,
+                    'location_dest_id': self.location_dest_id.id,
+                })
+            
+            if lines_vals:
+                self.env['stock.move.line'].create(lines_vals)
+
+        # 3. Forzar actualización de cantidades
+        return self.action_update_quantity_from_lines()
+
     def action_update_quantity_from_lines(self):
-        """
-        Recalcula la cantidad del move basándose en las move lines asignadas.
-        Llamado desde el JS después de confirmar selección de placas.
-        """
         self.ensure_one()
         total_qty = sum(self.move_line_ids.mapped('quantity'))
         _logger.info(

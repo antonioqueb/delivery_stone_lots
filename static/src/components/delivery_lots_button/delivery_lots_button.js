@@ -80,98 +80,41 @@ export class DeliveryLotsButton extends Component {
         return null;
     }
 
+    // ─── CORE UPDATE: Sincronización real con el formulario Odoo ──────────────
+    
     /**
-     * Actualización suave: sincroniza la cantidad en el record local
-     * sin hacer un reload completo del modelo (evita cerrar la UI).
+     * Le avisa a Odoo que debe recalcular y refrescar los campos (incluyendo el picking).
+     * Esto hace que todas tus otras dependencias funcionen.
      */
-    async _softSyncQuantity() {
-        const moveId = this.getMoveId();
-        if (!moveId) return;
+    async _syncOdooState() {
         try {
-            await this.orm.call("stock.move", "action_update_quantity_from_lines", [moveId]);
+            const wasExpanded = this.state.isExpanded;
 
-            const moveData = await this.orm.read("stock.move", [moveId], ["quantity", "product_uom_qty"]);
-            if (!moveData.length) return;
-
-            const newQty = moveData[0].quantity ?? moveData[0].product_uom_qty ?? 0;
-
-            this._updateQuantityInDOM(newQty);
-            this._patchRecordQuantity(newQty);
-        } catch (e) {
-            console.warn("[DLOTS] Error en _softSyncQuantity:", e);
-        }
-    }
-
-    /**
-     * Busca la celda de cantidad en la misma fila <tr> del botón
-     * y actualiza su texto directamente en el DOM.
-     */
-    _updateQuantityInDOM(newQty) {
-        try {
-            const btnEl = this.__owl__?.bdom?.el || this.el;
-            if (!btnEl) return;
-            const row = btnEl.closest?.("tr");
-            if (!row) return;
-
-            const qtyCell = row.querySelector('td[name="quantity"] .o_field_widget, td[name="product_uom_qty"] .o_field_widget')
-                || row.querySelector('td.o_data_cell .o_field_float, td.o_data_cell .o_field_number');
-
-            if (qtyCell) {
-                const span = qtyCell.querySelector('span, .o_field_float_toggle, .o_input');
-                if (span) {
-                    span.textContent = newQty.toFixed(2);
-                }
+            // 1. Recargar los datos del formulario entero de manera nativa (OWL)
+            if (this.props.record && this.props.record.model && this.props.record.model.root) {
+                await this.props.record.model.root.load();
             }
 
-            row.querySelectorAll('td.o_data_cell').forEach((td) => {
-                const field = td.getAttribute('name');
-                if (field === 'quantity' || field === 'product_uom_qty') {
-                    const inner = td.querySelector('.o_field_widget span') || td.querySelector('span');
-                    if (inner) {
-                        inner.textContent = newQty.toFixed(2);
+            // 2. Refrescar contadores internos del botón
+            await this._refreshCount();
+
+            // 3. Restaurar la tabla expandida (porque al hacer load() Odoo la borra del DOM)
+            if (wasExpanded) {
+                const btnEl = this.__owl__?.bdom?.el || this.el;
+                if (btnEl) {
+                    const tr = btnEl.closest("tr");
+                    if (tr) {
+                        if (!tr.nextElementSibling?.classList.contains("dlots-selected-row")) {
+                            this._detailsRow = null; 
+                            await this.injectSelectedTable(tr);
+                        } else {
+                            await this.refreshSelectedTable();
+                        }
                     }
                 }
-            });
-        } catch (e) {
-            console.warn("[DLOTS] _updateQuantityInDOM falló (no crítico):", e);
-        }
-    }
-
-    /**
-     * Intenta parchear el valor en el record OWL para mantener consistencia
-     * sin disparar un reload completo.
-     */
-    _patchRecordQuantity(newQty) {
-        try {
-            const record = this.props.record;
-            if (!record) return;
-            if (record.data) {
-                if ('quantity' in record.data) {
-                    record.data.quantity = newQty;
-                }
-                if ('product_uom_qty' in record.data) {
-                    record.data.product_uom_qty = newQty;
-                }
             }
         } catch (e) {
-            console.warn("[DLOTS] _patchRecordQuantity falló (no crítico):", e);
-        }
-    }
-
-    /**
-     * Actualiza el badge del botón principal directamente en el DOM
-     * SIN tocar this.state (evita re-render OWL que colapsa la fila).
-     */
-    _updateButtonBadge(count) {
-        try {
-            const btnEl = this.__owl__?.bdom?.el || this.el;
-            if (!btnEl) return;
-            const badge = btnEl.querySelector(".badge, .dlots-count, [data-lot-count]");
-            if (badge) {
-                badge.textContent = count;
-            }
-        } catch (e) {
-            console.warn("[DLOTS] _updateButtonBadge:", e);
+            console.warn("[DLOTS] Error sincronizando estado Odoo:", e);
         }
     }
 
@@ -412,9 +355,7 @@ export class DeliveryLotsButton extends Component {
     }
 
     /**
-     * Elimina un lote con animación suave.
-     * NO toca this.state para evitar re-render OWL que colapsa la fila.
-     * Actualiza todo directamente en el DOM.
+     * Elimina un lote con animación suave y sincroniza con el backend.
      */
     async removeLot(lotId) {
         const moveId = this.getMoveId();
@@ -422,27 +363,18 @@ export class DeliveryLotsButton extends Component {
 
         // 1. Animación de salida de la fila
         const row = this._detailsRow?.querySelector(`tr[data-lot-row="${lotId}"]`);
-        let removedQty = 0;
         if (row) {
-            const qtyCells = row.querySelectorAll("td.col-num.fw-semibold");
-            if (qtyCells.length) {
-                removedQty = parseFloat(qtyCells[0].textContent) || 0;
-            }
             row.style.transition = "opacity 0.25s ease, transform 0.25s ease";
             row.style.opacity = "0";
             row.style.transform = "translateX(-20px)";
         }
 
         try {
-            // 2. Eliminar en servidor (en paralelo con la animación)
-            const lines = await this.orm.searchRead(
-                "stock.move.line",
-                [["move_id", "=", moveId], ["lot_id", "=", lotId]],
-                ["id"]
-            );
-            if (lines.length) {
-                await this.orm.unlink("stock.move.line", lines.map((l) => l.id));
-            }
+            const currentIds = await this._getCurrentLotIds();
+            const newIds = currentIds.filter(id => id !== lotId);
+
+            // 2. Ejecutar la lógica segura de base de datos en Python
+            await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, newIds]);
 
             // 3. Quitar la fila del DOM después de la animación
             if (row) {
@@ -450,60 +382,12 @@ export class DeliveryLotsButton extends Component {
                 row.remove();
             }
 
-            // 4. Actualizar totales inline (sin re-render completo)
-            this._updateSelectedTotals(removedQty);
+            // 4. Sincronizar el entorno de Odoo (dispara otras dependencias)
+            await this._syncOdooState();
 
-            // 5. Sincronizar cantidad del move en servidor y actualizar DOM
-            await this._softSyncQuantity();
-
-            // 6. Actualizar el badge del botón SIN tocar this.state
-            const tbody = this._detailsRow?.querySelector(".dlots-sel-table tbody");
-            const newCount = tbody ? tbody.children.length : 0;
-            this._updateButtonBadge(newCount);
-
-            // 7. Si ya no hay filas, mostrar el mensaje vacío
-            if (newCount === 0) {
-                const body = this._detailsRow?.querySelector(".dlots-selected-body");
-                if (body) {
-                    body.innerHTML = `
-                        <div class="dlots-no-selection">
-                            <i class="fa fa-info-circle me-2 text-muted"></i>
-                            <span class="text-muted">Sin placas asignadas. Usa <strong>Agregar placa</strong> para comenzar.</span>
-                        </div>`;
-                }
-            }
         } catch (err) {
             console.error("[DLOTS] Error eliminando lote:", err);
             await this.refreshSelectedTable();
-        }
-    }
-
-    /**
-     * Actualiza los totales de la tabla seleccionada in-place
-     * sin reconstruir toda la tabla.
-     */
-    _updateSelectedTotals(removedQty) {
-        if (!this._detailsRow) return;
-
-        const countEl = this._detailsRow.querySelector(".dlots-total-count");
-        const qtyEl = this._detailsRow.querySelector(".dlots-total-qty");
-        const badge = this._detailsRow.querySelector(".dlots-sel-badge");
-
-        const tbody = this._detailsRow.querySelector(".dlots-sel-table tbody");
-        const newCount = tbody ? tbody.children.length : 0;
-
-        if (countEl) countEl.textContent = newCount;
-        if (badge) badge.textContent = newCount;
-
-        if (qtyEl && removedQty > 0) {
-            const currentTotal = parseFloat(qtyEl.textContent) || 0;
-            const newTotal = Math.max(0, currentTotal - removedQty);
-            qtyEl.textContent = newTotal.toFixed(2);
-        }
-
-        const footerTd = this._detailsRow.querySelector(".dlots-total-row td:first-child");
-        if (footerTd) {
-            footerTd.innerHTML = `Total (<span class="dlots-total-count">${newCount}</span> placa${newCount !== 1 ? "s" : ""}):`;
         }
     }
 
@@ -542,8 +426,6 @@ export class DeliveryLotsButton extends Component {
         const root = this._popupRoot;
         const PAGE_SIZE = 35;
         const moveId = this.getMoveId();
-        const locationId = this.getLocationId();
-        const locationDestId = this.getLocationDestId();
 
         const currentLotIds = await this._getCurrentLotIds();
 
@@ -828,61 +710,13 @@ export class DeliveryLotsButton extends Component {
             if (!moveId) return;
 
             try {
-                const currentLines = await this.orm.searchRead(
-                    "stock.move.line",
-                    [["move_id", "=", moveId]],
-                    ["id", "lot_id"]
-                );
-                const currentLotMap = {};
-                for (const l of currentLines) {
-                    if (l.lot_id) currentLotMap[l.lot_id[0]] = l.id;
-                }
-                const currentLotIds = new Set(Object.keys(currentLotMap).map(Number));
+                const finalLotIds = Array.from(state.pendingIds);
 
-                const toAdd = [...state.pendingIds].filter((id) => !currentLotIds.has(id));
-                const toRemove = [...currentLotIds].filter((id) => !state.pendingIds.has(id));
+                // 1. Backend realiza todos los cambios de manera segura (Añade, elimina, recalcula)
+                await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, finalLotIds]);
 
-                if (toRemove.length) {
-                    const idsToUnlink = toRemove.map((lotId) => currentLotMap[lotId]);
-                    await this.orm.unlink("stock.move.line", idsToUnlink);
-                }
-
-                for (const lotId of toAdd) {
-                    let qty = 0;
-                    let srcLocId = locationId;
-                    try {
-                        const quants = await this.orm.searchRead(
-                            "stock.quant",
-                            [
-                                ["lot_id", "=", lotId],
-                                ["product_id", "=", productId],
-                                ["location_id.usage", "=", "internal"],
-                                ["quantity", ">", 0],
-                            ],
-                            ["quantity", "location_id"],
-                            { limit: 1 }
-                        );
-                        if (quants.length) {
-                            qty = quants[0].quantity;
-                            srcLocId = quants[0].location_id[0];
-                        }
-                    } catch (_e) {}
-
-                    await this.orm.create("stock.move.line", [{
-                        move_id: moveId,
-                        lot_id: lotId,
-                        quantity: qty,
-                        product_id: productId,
-                        location_id: srcLocId || locationId,
-                        location_dest_id: locationDestId,
-                    }]);
-                }
-
-                // En confirm sí podemos tocar state porque la tabla
-                // se va a re-renderizar completa de todos modos
-                await this._softSyncQuantity();
-                await this._refreshCount();
-                await this.refreshSelectedTable();
+                // 2. Le avisamos a Odoo que refresque TODO el modelo.
+                await this._syncOdooState();
 
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
