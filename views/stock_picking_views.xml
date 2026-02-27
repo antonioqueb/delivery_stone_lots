@@ -3,10 +3,11 @@
     <!--
         Herencia del formulario del albarán de entrega.
         Añade el widget delivery_lots_button como primera columna en la
-        lista de movimientos (move_ids_without_package).
+        lista de movimientos.
 
-        El widget lee move_line_ids del stock.move para mostrar los lotes
-        asignados. Es completamente de solo lectura.
+        NOTA: En Odoo 19 la lista de operaciones usa move_ids (no
+        move_ids_without_package) y el tag es <list> en lugar de <tree>.
+        El xpath apunta al campo move_ids/list y posiciona antes de product_id.
     -->
     <record id="view_picking_form_delivery_lots" model="ir.ui.view">
         <field name="name">stock.picking.form.delivery.lots</field>
@@ -14,7 +15,7 @@
         <field name="inherit_id" ref="stock.view_picking_form"/>
         <field name="arch" type="xml">
 
-            <xpath expr="//field[@name='move_ids_without_package']/list/field[@name='product_id']" position="before">
+            <xpath expr="//field[@name='move_ids']/list/field[@name='product_id']" position="before">
                 <field
                     name="move_line_ids"
                     widget="delivery_lots_button"
