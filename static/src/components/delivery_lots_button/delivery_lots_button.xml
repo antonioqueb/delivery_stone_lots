@@ -1,25 +1,31 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<templates xml:space="preserve">
-    <!--
-        Template idéntico al StoneExpandButton de sale_stone_selection.
-        El popup se renderiza como DOM puro en document.body.
-    -->
-    <t t-name="delivery_stone_lots.DeliveryLotsButton" owl="1">
-        <div class="dlots-field-wrapper" t-on-click="handleToggle">
-            <button
-                class="dlots-toggle-btn"
-                t-att-class="state.isExpanded ? 'active' : ''"
-                title="Ver/gestionar placas asignadas"
-            >
-                <i class="fa fa-th-large" t-if="!state.isExpanded"/>
-                <i class="fa fa-chevron-up" t-if="state.isExpanded"/>
-                <span
-                    t-if="state.lotCount > 0 and !state.isExpanded"
-                    class="dlots-count-badge"
-                >
-                    <t t-esc="state.lotCount"/>
-                </span>
-            </button>
-        </div>
-    </t>
-</templates>
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_picking_form_delivery_lots" model="ir.ui.view">
+        <field name="name">stock.picking.form.delivery.lots</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock.view_picking_form"/>
+        <field name="arch" type="xml">
+
+            <!--
+                IMPORTANTE: En Odoo 19, la lista de movimientos en el picking form
+                usa move_ids con una list interna. El xpath debe apuntar al field
+                product_id DENTRO de esa list.
+                
+                Si el xpath falla, probar con:
+                  //field[@name='move_ids']//field[@name='product_id']
+                o buscar el nombre exacto de la columna en la vista base de Odoo.
+            -->
+            <xpath expr="//field[@name='move_ids']/list/field[@name='product_id']" position="before">
+                <field
+                    name="is_dlots_expanded"
+                    widget="delivery_lots_button"
+                    string=" "
+                    nolabel="1"
+                    class="p-0 text-center"
+                    width="40px"
+                />
+            </xpath>
+
+        </field>
+    </record>
+</odoo>

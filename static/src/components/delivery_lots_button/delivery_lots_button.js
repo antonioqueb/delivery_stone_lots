@@ -1,16 +1,12 @@
 /** @odoo-module */
 /**
- * delivery_lots_button.js
+ * delivery_lots_button.js — CORREGIDO
  *
- * Widget para visualizar y gestionar las placas asignadas a cada movimiento
- * en el albarán de entrega.
- *
- * PATRÓN: Idéntico a StoneExpandButton (sale_stone_selection):
- *  - Campo trigger: Boolean (is_dlots_expanded) → evita el problema de O2M sin sub-records.
- *  - Botón toggle → inyecta fila DOM puro bajo la fila actual.
- *  - Lee lotes vía ORM usando el resId del stock.move (NO depende de sub-records).
- *  - Tabla inline de placas seleccionadas con botón "Agregar placa" (popup).
- *  - Popup fullscreen (DOM puro en document.body) igual al de ventas.
+ * Fixes aplicados:
+ * 1. getMoveId() ahora lee correctamente el ID del registro en lista O2M
+ * 2. Se agregó supportedTypes: ["boolean"] para que Odoo 19 renderice el campo
+ * 3. Se corrigió el manejo del click para que no compita con el click del row
+ * 4. Se mejoró _refreshCount para que use el ID del record directamente
  */
 import { registry } from "@web/core/registry";
 import { standardFieldProps } from "@web/views/fields/standard_field_props";
@@ -44,8 +40,21 @@ export class DeliveryLotsButton extends Component {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     getMoveId(props = this.props) {
-        // El resId del record es el ID del stock.move
-        return props?.record?.resId || props?.record?.data?.id || null;
+        // En lista O2M de Odoo 19, el ID puede estar en diferentes lugares
+        const record = props?.record;
+        if (!record) return null;
+        
+        // Opción 1: resId (registro guardado)
+        if (record.resId && record.resId > 0) return record.resId;
+        
+        // Opción 2: data.id
+        const dataId = record.data?.id;
+        if (dataId && typeof dataId === 'number' && dataId > 0) return dataId;
+        
+        // Opción 3: id directamente
+        if (record.id && typeof record.id === 'number' && record.id > 0) return record.id;
+        
+        return null;
     }
 
     getProductId(props = this.props) {
@@ -99,12 +108,12 @@ export class DeliveryLotsButton extends Component {
                 "stock.move.line",
                 [["move_id", "=", moveId], ["lot_id", "!=", false]],
                 ["lot_id"],
-                { limit: 100 }
+                { limit: 200 }
             );
-            // Contar lotes únicos
             const uniqueLots = new Set(lines.map((l) => l.lot_id[0]));
             this.state.lotCount = uniqueLots.size;
         } catch (e) {
+            console.error("[DLOTS] Error refreshCount:", e);
             this.state.lotCount = 0;
         }
     }
@@ -112,22 +121,26 @@ export class DeliveryLotsButton extends Component {
     async _loadCurrentLotData() {
         const moveId = this.getMoveId();
         if (!moveId) return [];
-        const lines = await this.orm.searchRead(
-            "stock.move.line",
-            [["move_id", "=", moveId], ["lot_id", "!=", false]],
-            ["lot_id", "quantity", "location_id"],
-            { limit: 200 }
-        );
-        // Agrupar por lotId (puede haber varias líneas del mismo lote)
-        const map = {};
-        for (const l of lines) {
-            const lotId = l.lot_id[0];
-            if (!map[lotId]) {
-                map[lotId] = { lotId, lotName: l.lot_id[1], qty: 0, locationName: l.location_id?.[1] || "" };
+        try {
+            const lines = await this.orm.searchRead(
+                "stock.move.line",
+                [["move_id", "=", moveId], ["lot_id", "!=", false]],
+                ["lot_id", "quantity", "location_id"],
+                { limit: 500 }
+            );
+            const map = {};
+            for (const l of lines) {
+                const lotId = l.lot_id[0];
+                if (!map[lotId]) {
+                    map[lotId] = { lotId, lotName: l.lot_id[1], qty: 0, locationName: l.location_id?.[1] || "" };
+                }
+                map[lotId].qty += l.quantity || 0;
             }
-            map[lotId].qty += l.quantity || 0;
+            return Object.values(map);
+        } catch (e) {
+            console.error("[DLOTS] Error _loadCurrentLotData:", e);
+            return [];
         }
-        return Object.values(map);
     }
 
     async _getCurrentLotIds() {
@@ -139,6 +152,7 @@ export class DeliveryLotsButton extends Component {
 
     async handleToggle(ev) {
         ev.stopPropagation();
+        ev.preventDefault();
 
         if (this.state.isExpanded) {
             this.removeDetailsRow();
@@ -146,8 +160,18 @@ export class DeliveryLotsButton extends Component {
             return;
         }
 
+        const moveId = this.getMoveId();
+        if (!moveId) {
+            console.warn("[DLOTS] No hay moveId disponible — ¿El picking está guardado?");
+            // Mostrar un tooltip o mensaje al usuario
+            alert("Guarda el albarán antes de gestionar las placas.");
+            return;
+        }
+
         // Cerrar cualquier otro expandido
         document.querySelectorAll(".dlots-selected-row").forEach((e) => e.remove());
+        // También cerrar filas de stone_line_list si existieran
+        document.querySelectorAll(".stone-selected-row").forEach((e) => e.remove());
 
         const tr = ev.currentTarget.closest("tr");
         if (!tr) return;
@@ -156,7 +180,7 @@ export class DeliveryLotsButton extends Component {
         await this.injectSelectedTable(tr);
     }
 
-    // ─── Tabla inline de seleccionadas (idéntica a stone_line_list) ───────────
+    // ─── Tabla inline de seleccionadas ────────────────────────────────────────
 
     async injectSelectedTable(currentRow) {
         const newTr = document.createElement("tr");
@@ -198,11 +222,14 @@ export class DeliveryLotsButton extends Component {
 
         header.querySelector(".dlots-add-btn-trigger").addEventListener("click", (e) => {
             e.stopPropagation();
+            e.preventDefault();
             this.openPopup();
         });
     }
 
     async renderSelectedTable(container) {
+        container.innerHTML = `<div class="dlots-table-loading"><i class="fa fa-circle-o-notch fa-spin me-2"></i> Cargando datos...</div>`;
+
         const moveLineData = await this._loadCurrentLotData();
 
         if (!moveLineData.length) {
@@ -213,8 +240,6 @@ export class DeliveryLotsButton extends Component {
                 </div>`;
             return;
         }
-
-        container.innerHTML = `<div class="dlots-table-loading"><i class="fa fa-circle-o-notch fa-spin me-2"></i> Cargando datos...</div>`;
 
         try {
             const lotIds = moveLineData.map((d) => d.lotId);
@@ -301,6 +326,7 @@ export class DeliveryLotsButton extends Component {
             container.querySelectorAll(".dlots-remove-btn").forEach((btn) => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
+                    e.preventDefault();
                     await this.removeLot(parseInt(btn.dataset.lotId));
                 });
             });
@@ -314,16 +340,14 @@ export class DeliveryLotsButton extends Component {
         const moveId = this.getMoveId();
         if (!moveId) return;
         try {
-            // Buscar las move_line_ids que corresponden a este lote en este move
+            // Eliminar directamente vía ORM (más confiable que record.update en lista picking)
             const lines = await this.orm.searchRead(
                 "stock.move.line",
                 [["move_id", "=", moveId], ["lot_id", "=", lotId]],
                 ["id"]
             );
             if (lines.length) {
-                // Eliminar via record.update para respetar el flujo OWL
-                const commands = lines.map((l) => [2, l.id, 0]);
-                await this.props.record.update({ move_line_ids: commands });
+                await this.orm.unlink("stock.move.line", lines.map((l) => l.id));
             }
             await this._refreshCount();
             await this.refreshSelectedTable();
@@ -350,7 +374,6 @@ export class DeliveryLotsButton extends Component {
     }
 
     // ─── POPUP fullscreen (DOM puro en document.body) ─────────────────────────
-    // Idéntico al patrón de stone_line_list pero con lógica de stock.move.line
 
     async openPopup() {
         this.destroyPopup();
@@ -370,9 +393,7 @@ export class DeliveryLotsButton extends Component {
         const moveId = this.getMoveId();
         const locationId = this.getLocationId();
         const locationDestId = this.getLocationDestId();
-        const pickingId = this.getPickingId();
 
-        // Lotes ya asignados al move
         const currentLotIds = await this._getCurrentLotIds();
 
         const state = {
@@ -666,7 +687,7 @@ export class DeliveryLotsButton extends Component {
             renderTable();
         };
 
-        // Confirmar: sincronizar move_line_ids del stock.move
+        // ─── Confirmar: escribir directamente vía ORM (no record.update) ─────
         const doConfirm = async () => {
             this.destroyPopup();
 
@@ -689,16 +710,14 @@ export class DeliveryLotsButton extends Component {
                 const toAdd = [...state.pendingIds].filter((id) => !currentLotIds.has(id));
                 const toRemove = [...currentLotIds].filter((id) => !state.pendingIds.has(id));
 
-                const commands = [];
-
                 // Eliminar los que se quitaron
-                for (const lotId of toRemove) {
-                    commands.push([2, currentLotMap[lotId], 0]);
+                if (toRemove.length) {
+                    const idsToUnlink = toRemove.map((lotId) => currentLotMap[lotId]);
+                    await this.orm.unlink("stock.move.line", idsToUnlink);
                 }
 
                 // Agregar los nuevos
                 for (const lotId of toAdd) {
-                    // Buscar cantidad real del lote en la ubicación del movimiento
                     let qty = 0;
                     let srcLocId = locationId;
                     try {
@@ -719,7 +738,8 @@ export class DeliveryLotsButton extends Component {
                         }
                     } catch (_e) {}
 
-                    commands.push([0, 0, {
+                    await this.orm.create("stock.move.line", [{
+                        move_id: moveId,
                         lot_id: lotId,
                         quantity: qty,
                         product_id: productId,
@@ -728,14 +748,17 @@ export class DeliveryLotsButton extends Component {
                     }]);
                 }
 
-                if (commands.length) {
-                    await this.props.record.update({ move_line_ids: commands });
-                }
-
                 await this._refreshCount();
                 await this.refreshSelectedTable();
+
+                // Recargar el picking para reflejar cambios en la vista
+                if (this.props.record?.model?.load) {
+                    await this.props.record.model.load();
+                }
+
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
+                alert(`Error al guardar: ${err.message}`);
             }
         };
 
@@ -786,8 +809,9 @@ export class DeliveryLotsButton extends Component {
     }
 }
 
-// Registrar como campo genérico (sin supportedTypes) — igual que stone_expand_button
+// CRÍTICO: supportedTypes: ["boolean"] para que Odoo 19 acepte el widget en listas
 registry.category("fields").add("delivery_lots_button", {
     component: DeliveryLotsButton,
     displayName: "Botón Lotes Albarán",
+    supportedTypes: ["boolean"],
 });
