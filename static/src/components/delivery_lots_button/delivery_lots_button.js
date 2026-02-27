@@ -90,6 +90,20 @@ export class DeliveryLotsButton extends Component {
         }
     }
 
+    /**
+     * Llama al método del servidor para recalcular la cantidad del move
+     * basándose en las move lines actuales.
+     */
+    async _syncMoveQuantity() {
+        const moveId = this.getMoveId();
+        if (!moveId) return;
+        try {
+            await this.orm.call("stock.move", "action_update_quantity_from_lines", [moveId]);
+        } catch (e) {
+            console.warn("[DLOTS] Error sincronizando cantidad del move:", e);
+        }
+    }
+
     async _refreshCount(props = this.props) {
         const moveId = this.getMoveId(props);
         if (!moveId) {
@@ -338,7 +352,8 @@ export class DeliveryLotsButton extends Component {
             if (lines.length) {
                 await this.orm.unlink("stock.move.line", lines.map((l) => l.id));
             }
-            // FIX #2: Refrescar count + tabla inline + recargar modelo para actualizar cantidad en la lista
+            // Sincronizar cantidad del move con las lines restantes
+            await this._syncMoveQuantity();
             await this._refreshCount();
             await this.refreshSelectedTable();
             await this._reloadModel();
@@ -606,9 +621,6 @@ export class DeliveryLotsButton extends Component {
             }
         };
 
-        // FIX #1: Llamar a search_stone_inventory_for_delivery (método de entrega),
-        // NO al método de ventas (search_stone_inventory_for_so).
-        // Esto permite mostrar TODO el inventario disponible sin restricciones del SO.
         const loadPage = async (page, reset) => {
             if (reset) {
                 state.isLoading = true;
@@ -721,9 +733,10 @@ export class DeliveryLotsButton extends Component {
                     }]);
                 }
 
+                // Sincronizar cantidad del move con el total de las lines
+                await this._syncMoveQuantity();
                 await this._refreshCount();
                 await this.refreshSelectedTable();
-                // FIX #2: Recargar modelo para reflejar cantidad actualizada en la lista
                 await this._reloadModel();
 
             } catch (err) {
