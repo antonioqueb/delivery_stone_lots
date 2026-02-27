@@ -80,27 +80,96 @@ export class DeliveryLotsButton extends Component {
         return null;
     }
 
-    async _reloadModel() {
+    /**
+     * Actualización suave: sincroniza la cantidad en el record local
+     * sin hacer un reload completo del modelo (evita cerrar la UI).
+     */
+    async _softSyncQuantity() {
+        const moveId = this.getMoveId();
+        if (!moveId) return;
         try {
-            if (this.props.record?.model?.load) {
-                await this.props.record.model.load();
-            }
+            // 1. Sincronizar en servidor
+            await this.orm.call("stock.move", "action_update_quantity_from_lines", [moveId]);
+
+            // 2. Leer la cantidad actualizada del servidor
+            const moveData = await this.orm.read("stock.move", [moveId], ["quantity", "product_uom_qty"]);
+            if (!moveData.length) return;
+
+            const newQty = moveData[0].quantity ?? moveData[0].product_uom_qty ?? 0;
+
+            // 3. Actualizar visualmente la celda de cantidad en la fila del move
+            //    sin recargar el modelo completo
+            this._updateQuantityInDOM(newQty);
+
+            // 4. Si el record OWL tiene update, intentar parchear localmente
+            this._patchRecordQuantity(newQty);
+
         } catch (e) {
-            console.warn("[DLOTS] No se pudo recargar el modelo:", e);
+            console.warn("[DLOTS] Error en _softSyncQuantity:", e);
         }
     }
 
     /**
-     * Llama al método del servidor para recalcular la cantidad del move
-     * basándose en las move lines actuales.
+     * Busca la celda de cantidad en la misma fila <tr> del botón
+     * y actualiza su texto directamente en el DOM.
      */
-    async _syncMoveQuantity() {
-        const moveId = this.getMoveId();
-        if (!moveId) return;
+    _updateQuantityInDOM(newQty) {
         try {
-            await this.orm.call("stock.move", "action_update_quantity_from_lines", [moveId]);
+            // Encontrar la fila <tr> que contiene este widget
+            const btnEl = this.__owl__?.bdom?.el || this.el;
+            if (!btnEl) return;
+            const row = btnEl.closest?.("tr");
+            if (!row) return;
+
+            // Buscar la celda del campo quantity o product_uom_qty
+            // Odoo usa el atributo name en el <td> o data-field
+            const qtyCell = row.querySelector('td[name="quantity"] .o_field_widget, td[name="product_uom_qty"] .o_field_widget')
+                || row.querySelector('td.o_data_cell .o_field_float, td.o_data_cell .o_field_number');
+
+            if (qtyCell) {
+                // Buscar el span o input dentro del widget
+                const span = qtyCell.querySelector('span, .o_field_float_toggle, .o_input');
+                if (span) {
+                    span.textContent = newQty.toFixed(2);
+                }
+            }
+
+            // Enfoque alternativo: buscar por data-tooltip-info o por contenido
+            // en caso de que la estructura DOM sea diferente
+            row.querySelectorAll('td.o_data_cell').forEach((td) => {
+                const field = td.getAttribute('name');
+                if (field === 'quantity' || field === 'product_uom_qty') {
+                    const inner = td.querySelector('.o_field_widget span') || td.querySelector('span');
+                    if (inner) {
+                        inner.textContent = newQty.toFixed(2);
+                    }
+                }
+            });
         } catch (e) {
-            console.warn("[DLOTS] Error sincronizando cantidad del move:", e);
+            console.warn("[DLOTS] _updateQuantityInDOM falló (no crítico):", e);
+        }
+    }
+
+    /**
+     * Intenta parchear el valor en el record OWL para mantener consistencia
+     * sin disparar un reload completo.
+     */
+    _patchRecordQuantity(newQty) {
+        try {
+            const record = this.props.record;
+            if (!record) return;
+
+            // Intentar actualizar via record.update (OWL record)
+            if (record.data) {
+                if ('quantity' in record.data) {
+                    record.data.quantity = newQty;
+                }
+                if ('product_uom_qty' in record.data) {
+                    record.data.product_uom_qty = newQty;
+                }
+            }
+        } catch (e) {
+            console.warn("[DLOTS] _patchRecordQuantity falló (no crítico):", e);
         }
     }
 
@@ -269,7 +338,7 @@ export class DeliveryLotsButton extends Component {
                 totalQty += qty;
 
                 rows += `
-                    <tr>
+                    <tr data-lot-row="${lotId}">
                         <td class="cell-lot">${lot.name}</td>
                         <td>${lot.x_bloque || "-"}</td>
                         <td>${lot.x_atado || "-"}</td>
@@ -319,9 +388,9 @@ export class DeliveryLotsButton extends Component {
                     <tfoot>
                         <tr class="dlots-total-row">
                             <td colspan="7" class="text-end fw-bold text-muted">
-                                Total (${lotIds.length} placa${lotIds.length !== 1 ? "s" : ""}):
+                                Total (<span class="dlots-total-count">${lotIds.length}</span> placa${lotIds.length !== 1 ? "s" : ""}):
                             </td>
-                            <td class="col-num fw-bold">${totalQty.toFixed(2)}</td>
+                            <td class="col-num fw-bold dlots-total-qty">${totalQty.toFixed(2)}</td>
                             <td colspan="6"></td>
                         </tr>
                     </tfoot>
@@ -340,10 +409,32 @@ export class DeliveryLotsButton extends Component {
         }
     }
 
+    /**
+     * Elimina un lote con animación suave:
+     * - Anima la fila saliendo
+     * - Elimina la move line en servidor
+     * - Actualiza totales in-place sin recargar nada
+     */
     async removeLot(lotId) {
         const moveId = this.getMoveId();
         if (!moveId) return;
+
+        // 1. Animación de salida de la fila
+        const row = this._detailsRow?.querySelector(`tr[data-lot-row="${lotId}"]`);
+        let removedQty = 0;
+        if (row) {
+            // Capturar la cantidad de esta fila antes de animarla
+            const qtyCells = row.querySelectorAll("td.col-num.fw-semibold");
+            if (qtyCells.length) {
+                removedQty = parseFloat(qtyCells[0].textContent) || 0;
+            }
+            row.style.transition = "opacity 0.25s ease, transform 0.25s ease";
+            row.style.opacity = "0";
+            row.style.transform = "translateX(-20px)";
+        }
+
         try {
+            // 2. Eliminar en servidor (en paralelo con la animación)
             const lines = await this.orm.searchRead(
                 "stock.move.line",
                 [["move_id", "=", moveId], ["lot_id", "=", lotId]],
@@ -352,13 +443,69 @@ export class DeliveryLotsButton extends Component {
             if (lines.length) {
                 await this.orm.unlink("stock.move.line", lines.map((l) => l.id));
             }
-            // Sincronizar cantidad del move con las lines restantes
-            await this._syncMoveQuantity();
+
+            // 3. Quitar la fila del DOM después de la animación
+            if (row) {
+                await new Promise((r) => setTimeout(r, 260));
+                row.remove();
+            }
+
+            // 4. Actualizar totales inline (sin re-render completo)
+            this._updateSelectedTotals(removedQty);
+
+            // 5. Sincronizar cantidad del move en servidor y actualizar DOM
+            await this._softSyncQuantity();
+
+            // 6. Actualizar el badge del botón
             await this._refreshCount();
-            await this.refreshSelectedTable();
-            await this._reloadModel();
+
+            // 7. Si ya no hay filas, mostrar el mensaje vacío
+            const tbody = this._detailsRow?.querySelector(".dlots-sel-table tbody");
+            if (tbody && tbody.children.length === 0) {
+                const body = this._detailsRow.querySelector(".dlots-selected-body");
+                if (body) {
+                    body.innerHTML = `
+                        <div class="dlots-no-selection">
+                            <i class="fa fa-info-circle me-2 text-muted"></i>
+                            <span class="text-muted">Sin placas asignadas. Usa <strong>Agregar placa</strong> para comenzar.</span>
+                        </div>`;
+                }
+            }
         } catch (err) {
             console.error("[DLOTS] Error eliminando lote:", err);
+            // Si falló, re-renderizar la tabla para estado consistente
+            await this.refreshSelectedTable();
+        }
+    }
+
+    /**
+     * Actualiza los totales de la tabla seleccionada in-place
+     * sin reconstruir toda la tabla.
+     */
+    _updateSelectedTotals(removedQty) {
+        if (!this._detailsRow) return;
+
+        // Actualizar conteo en el footer
+        const countEl = this._detailsRow.querySelector(".dlots-total-count");
+        const qtyEl = this._detailsRow.querySelector(".dlots-total-qty");
+        const badge = this._detailsRow.querySelector(".dlots-sel-badge");
+
+        const tbody = this._detailsRow.querySelector(".dlots-sel-table tbody");
+        const newCount = tbody ? tbody.children.length : 0;
+
+        if (countEl) countEl.textContent = newCount;
+        if (badge) badge.textContent = newCount;
+
+        if (qtyEl && removedQty > 0) {
+            const currentTotal = parseFloat(qtyEl.textContent) || 0;
+            const newTotal = Math.max(0, currentTotal - removedQty);
+            qtyEl.textContent = newTotal.toFixed(2);
+        }
+
+        // Actualizar texto del footer (singular/plural)
+        const footerTd = this._detailsRow.querySelector(".dlots-total-row td:first-child");
+        if (footerTd) {
+            footerTd.innerHTML = `Total (<span class="dlots-total-count">${newCount}</span> placa${newCount !== 1 ? "s" : ""}):`;
         }
     }
 
@@ -733,11 +880,10 @@ export class DeliveryLotsButton extends Component {
                     }]);
                 }
 
-                // Sincronizar cantidad del move con el total de las lines
-                await this._syncMoveQuantity();
+                // Sincronizar cantidad del move suavemente
+                await this._softSyncQuantity();
                 await this._refreshCount();
                 await this.refreshSelectedTable();
-                await this._reloadModel();
 
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
