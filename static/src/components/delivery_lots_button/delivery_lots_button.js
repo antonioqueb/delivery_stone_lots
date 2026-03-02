@@ -80,32 +80,23 @@ export class DeliveryLotsButton extends Component {
         return null;
     }
 
-    // ─── CORE UPDATE: Sincronización real con el formulario Odoo ──────────────
-    
-    /**
-     * Le avisa a Odoo que debe recalcular y refrescar los campos (incluyendo el picking).
-     * Esto hace que todas tus otras dependencias funcionen.
-     */
     async _syncOdooState() {
         try {
             const wasExpanded = this.state.isExpanded;
 
-            // 1. Recargar los datos del formulario entero de manera nativa (OWL)
             if (this.props.record && this.props.record.model && this.props.record.model.root) {
                 await this.props.record.model.root.load();
             }
 
-            // 2. Refrescar contadores internos del botón
             await this._refreshCount();
 
-            // 3. Restaurar la tabla expandida (porque al hacer load() Odoo la borra del DOM)
             if (wasExpanded) {
                 const btnEl = this.__owl__?.bdom?.el || this.el;
                 if (btnEl) {
                     const tr = btnEl.closest("tr");
                     if (tr) {
                         if (!tr.nextElementSibling?.classList.contains("dlots-selected-row")) {
-                            this._detailsRow = null; 
+                            this._detailsRow = null;
                             await this.injectSelectedTable(tr);
                         } else {
                             await this.refreshSelectedTable();
@@ -354,14 +345,10 @@ export class DeliveryLotsButton extends Component {
         }
     }
 
-    /**
-     * Elimina un lote con animación suave y sincroniza con el backend.
-     */
     async removeLot(lotId) {
         const moveId = this.getMoveId();
         if (!moveId) return;
 
-        // 1. Animación de salida de la fila
         const row = this._detailsRow?.querySelector(`tr[data-lot-row="${lotId}"]`);
         if (row) {
             row.style.transition = "opacity 0.25s ease, transform 0.25s ease";
@@ -373,16 +360,13 @@ export class DeliveryLotsButton extends Component {
             const currentIds = await this._getCurrentLotIds();
             const newIds = currentIds.filter(id => id !== lotId);
 
-            // 2. Ejecutar la lógica segura de base de datos en Python
             await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, newIds]);
 
-            // 3. Quitar la fila del DOM después de la animación
             if (row) {
                 await new Promise((r) => setTimeout(r, 260));
                 row.remove();
             }
 
-            // 4. Sincronizar el entorno de Odoo (dispara otras dependencias)
             await this._syncOdooState();
 
         } catch (err) {
@@ -487,6 +471,14 @@ export class DeliveryLotsButton extends Component {
                             <label>Ancho mín.</label>
                             <input type="number" class="dlots-filter-input dlots-filter-sm" id="df-ancho" placeholder="0"/>
                         </div>
+                        <div class="dlots-filter-actions">
+                            <button class="dlots-btn dlots-btn-select-all" id="dp-select-all" title="Seleccionar todas las placas visibles">
+                                <i class="fa fa-check-square-o me-1"></i> Seleccionar todo
+                            </button>
+                            <button class="dlots-btn dlots-btn-clear-all" id="dp-clear-all" title="Borrar toda la selección">
+                                <i class="fa fa-square-o me-1"></i> Borrar selección
+                            </button>
+                        </div>
                         <div class="dlots-filter-spacer"></div>
                         <div class="dlots-filter-stats">
                             <span id="dp-stat" class="dlots-filter-stat-loading">
@@ -529,6 +521,55 @@ export class DeliveryLotsButton extends Component {
             footerInfo.innerHTML = `Mostrando <strong>${state.quants.length}</strong> de <strong>${state.totalCount}</strong>`;
         };
 
+        // ─── Seleccionar todo (visibles/cargadas) ────────────────────────────
+        const doSelectAll = () => {
+            for (const q of state.quants) {
+                const lotId = q.lot_id ? q.lot_id[0] : 0;
+                if (lotId) state.pendingIds.add(lotId);
+            }
+            updateBadge();
+            body.querySelectorAll("tr[data-lot-id]").forEach((tr) => {
+                const lotId = parseInt(tr.dataset.lotId);
+                if (!lotId) return;
+                tr.className = "row-sel";
+                const chk = tr.querySelector(".dlots-chkbox");
+                if (chk) {
+                    chk.className = "dlots-chkbox checked";
+                    chk.innerHTML = '<i class="fa fa-check"></i>';
+                }
+                const tag = tr.querySelector(".dlots-tag");
+                if (tag) {
+                    tag.className = "dlots-tag dlots-tag-ok";
+                    tag.textContent = "Selec.";
+                }
+            });
+        };
+
+        // ─── Borrar selección ────────────────────────────────────────────────
+        const doClearAll = () => {
+            state.pendingIds.clear();
+            updateBadge();
+            body.querySelectorAll("tr[data-lot-id]").forEach((tr) => {
+                tr.className = "";
+                const chk = tr.querySelector(".dlots-chkbox");
+                if (chk) {
+                    chk.className = "dlots-chkbox";
+                    chk.innerHTML = "";
+                }
+                const tag = tr.querySelector(".dlots-tag");
+                if (tag) {
+                    const reserved = tr.dataset.reserved === "1";
+                    if (reserved) {
+                        tag.className = "dlots-tag dlots-tag-warn";
+                        tag.textContent = "Reservado";
+                    } else {
+                        tag.className = "dlots-tag dlots-tag-free";
+                        tag.textContent = "Libre";
+                    }
+                }
+            });
+        };
+
         const renderTable = () => {
             if (state.quants.length === 0 && !state.isLoading) {
                 body.innerHTML = `
@@ -553,7 +594,7 @@ export class DeliveryLotsButton extends Component {
                 else if (reserved) statusBadge = `<span class="dlots-tag dlots-tag-warn">Reservado</span>`;
 
                 rows += `
-                    <tr class="${sel ? "row-sel" : ""}" data-lot-id="${lotId}">
+                    <tr class="${sel ? "row-sel" : ""}" data-lot-id="${lotId}" data-reserved="${reserved ? "1" : "0"}">
                         <td class="col-chk">
                             <div class="dlots-chkbox ${sel ? "checked" : ""}">
                                 ${sel ? '<i class="fa fa-check"></i>' : ""}
@@ -622,8 +663,14 @@ export class DeliveryLotsButton extends Component {
                     }
                     const tag = tr.querySelector(".dlots-tag");
                     if (tag) {
-                        tag.className = sel ? "dlots-tag dlots-tag-ok" : "dlots-tag dlots-tag-free";
-                        tag.textContent = sel ? "Selec." : "Libre";
+                        if (sel) {
+                            tag.className = "dlots-tag dlots-tag-ok";
+                            tag.textContent = "Selec.";
+                        } else {
+                            const reserved = tr.dataset.reserved === "1";
+                            tag.className = reserved ? "dlots-tag dlots-tag-warn" : "dlots-tag dlots-tag-free";
+                            tag.textContent = reserved ? "Reservado" : "Libre";
+                        }
                     }
                     updateBadge();
                 });
@@ -711,13 +758,8 @@ export class DeliveryLotsButton extends Component {
 
             try {
                 const finalLotIds = Array.from(state.pendingIds);
-
-                // 1. Backend realiza todos los cambios de manera segura (Añade, elimina, recalcula)
                 await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, finalLotIds]);
-
-                // 2. Le avisamos a Odoo que refresque TODO el modelo.
                 await this._syncOdooState();
-
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
                 alert(`Error al guardar: ${err.message}`);
@@ -730,6 +772,8 @@ export class DeliveryLotsButton extends Component {
         root.querySelector("#dp-cancel").addEventListener("click", doClose);
         root.querySelector("#dp-confirm-top").addEventListener("click", doConfirm);
         root.querySelector("#dp-confirm-bottom").addEventListener("click", doConfirm);
+        root.querySelector("#dp-select-all").addEventListener("click", doSelectAll);
+        root.querySelector("#dp-clear-all").addEventListener("click", doClearAll);
         overlay.addEventListener("click", (e) => { if (e.target === overlay) doClose(); });
 
         const onKeyDown = (e) => { if (e.key === "Escape") doClose(); };
