@@ -29,12 +29,16 @@ class StockMove(models.Model):
             else:
                 move.x_original_demand = 0.0
 
-    def action_set_delivery_lots(self, lot_ids):
+    def action_set_delivery_lots(self, lot_ids, breakdown=None):
         """
         Recibe los IDs exactos que deben quedar asignados a este movimiento.
+        breakdown: dict {lot_id_str: qty} para formatos/piezas con cantidades parciales.
         Crea los faltantes, elimina los removidos y fuerza la sincronización.
         """
         self.ensure_one()
+        if not breakdown:
+            breakdown = {}
+
         current_lines = self.move_line_ids.filtered(lambda l: l.lot_id)
         current_lot_map = {line.lot_id.id: line for line in current_lines}
         current_lot_ids = set(current_lot_map.keys())
@@ -42,6 +46,7 @@ class StockMove(models.Model):
 
         to_remove = current_lot_ids - new_lot_ids
         to_add = new_lot_ids - current_lot_ids
+        to_keep = current_lot_ids & new_lot_ids
 
         # 1. Eliminar placas deseleccionadas
         if to_remove:
@@ -59,8 +64,11 @@ class StockMove(models.Model):
                     ('quantity', '>', 0)
                 ], limit=1)
 
-                qty = quant.quantity if quant else 0.0
+                full_qty = quant.quantity if quant else 0.0
                 loc_id = quant.location_id.id if quant else self.location_id.id
+
+                # Determinar cantidad: breakdown parcial o quant completo
+                qty = self._get_delivery_lot_qty(lot_id, full_qty, breakdown)
 
                 lines_vals.append({
                     'move_id': self.id,
@@ -71,12 +79,62 @@ class StockMove(models.Model):
                     'location_id': loc_id,
                     'location_dest_id': self.location_dest_id.id,
                 })
-            
+
             if lines_vals:
                 self.env['stock.move.line'].create(lines_vals)
 
-        # 3. Forzar actualización de cantidades
+        # 3. Actualizar cantidades de lotes que ya existían si cambiaron en breakdown
+        if to_keep and breakdown:
+            for lot_id in to_keep:
+                lot_id_str = str(lot_id)
+                if lot_id_str in breakdown:
+                    line = current_lot_map.get(lot_id)
+                    if not line:
+                        continue
+                    # Verificar tipo del lote
+                    lot = self.env['stock.lot'].browse(lot_id)
+                    tipo = (lot.x_tipo or 'placa').lower() if lot.exists() else 'placa'
+                    if tipo in ('formato', 'pieza'):
+                        new_qty = float(breakdown[lot_id_str])
+                        # No exceder stock físico
+                        quant = self.env['stock.quant'].search([
+                            ('lot_id', '=', lot_id),
+                            ('product_id', '=', self.product_id.id),
+                            ('location_id.usage', '=', 'internal'),
+                            ('quantity', '>', 0)
+                        ], limit=1)
+                        if quant:
+                            new_qty = min(new_qty, quant.quantity)
+                        if line.quantity != new_qty:
+                            _logger.info(
+                                "[DLOTS] Corrigiendo qty lote %s de %s a %s",
+                                lot.name, line.quantity, new_qty,
+                            )
+                            line.write({'quantity': new_qty})
+
+        # 4. Forzar actualización de cantidades
         return self.action_update_quantity_from_lines()
+
+    def _get_delivery_lot_qty(self, lot_id, full_qty, breakdown):
+        """
+        Determina la cantidad a asignar para un lote.
+        - formato/pieza: usa breakdown si existe, sino full_qty
+        - placa: siempre full_qty
+        """
+        lot = self.env['stock.lot'].browse(lot_id)
+        if not lot.exists():
+            return full_qty
+
+        tipo = (lot.x_tipo or 'placa').lower()
+        if tipo not in ('formato', 'pieza'):
+            return full_qty
+
+        lot_id_str = str(lot_id)
+        if lot_id_str in breakdown:
+            partial_qty = float(breakdown[lot_id_str])
+            return min(partial_qty, full_qty) if full_qty > 0 else partial_qty
+
+        return full_qty
 
     def action_update_quantity_from_lines(self):
         self.ensure_one()
