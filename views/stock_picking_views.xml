@@ -13,10 +13,10 @@
                     string=" "
                     nolabel="1"
                     class="p-0 text-center"
+                    width="36px"
                 />
             </xpath>
 
-            <!-- Columna Solicitud Original después de quantity -->
             <xpath expr="//field[@name='move_ids']/list/field[@name='quantity']" position="after">
                 <field
                     name="x_original_demand"

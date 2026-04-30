@@ -68,12 +68,16 @@ class StockMove(models.Model):
             else:
                 move.x_original_demand = 0.0
 
-    def action_set_delivery_lots(self, lot_ids):
+    def action_set_delivery_lots(self, lot_ids, breakdown=None):
         """
         Recibe los IDs exactos que deben quedar asignados a este movimiento.
+        breakdown: dict {lot_id_str: qty} para formatos/piezas con cantidades parciales.
         Crea los faltantes, elimina los removidos y fuerza la sincronización.
         """
         self.ensure_one()
+        if not breakdown:
+            breakdown = {}
+
         current_lines = self.move_line_ids.filtered(lambda l: l.lot_id)
         current_lot_map = {line.lot_id.id: line for line in current_lines}
         current_lot_ids = set(current_lot_map.keys())
@@ -81,6 +85,7 @@ class StockMove(models.Model):
 
         to_remove = current_lot_ids - new_lot_ids
         to_add = new_lot_ids - current_lot_ids
+        to_keep = current_lot_ids & new_lot_ids
 
         # 1. Eliminar placas deseleccionadas
         if to_remove:
@@ -98,8 +103,11 @@ class StockMove(models.Model):
                     ('quantity', '>', 0)
                 ], limit=1)
 
-                qty = quant.quantity if quant else 0.0
+                full_qty = quant.quantity if quant else 0.0
                 loc_id = quant.location_id.id if quant else self.location_id.id
+
+                # Determinar cantidad: breakdown parcial o quant completo
+                qty = self._get_delivery_lot_qty(lot_id, full_qty, breakdown)
 
                 lines_vals.append({
                     'move_id': self.id,
@@ -110,12 +118,62 @@ class StockMove(models.Model):
                     'location_id': loc_id,
                     'location_dest_id': self.location_dest_id.id,
                 })
-            
+
             if lines_vals:
                 self.env['stock.move.line'].create(lines_vals)
 
-        # 3. Forzar actualización de cantidades
+        # 3. Actualizar cantidades de lotes que ya existían si cambiaron en breakdown
+        if to_keep and breakdown:
+            for lot_id in to_keep:
+                lot_id_str = str(lot_id)
+                if lot_id_str in breakdown:
+                    line = current_lot_map.get(lot_id)
+                    if not line:
+                        continue
+                    # Verificar tipo del lote
+                    lot = self.env['stock.lot'].browse(lot_id)
+                    tipo = (lot.x_tipo or 'placa').lower() if lot.exists() else 'placa'
+                    if tipo in ('formato', 'pieza'):
+                        new_qty = float(breakdown[lot_id_str])
+                        # No exceder stock físico
+                        quant = self.env['stock.quant'].search([
+                            ('lot_id', '=', lot_id),
+                            ('product_id', '=', self.product_id.id),
+                            ('location_id.usage', '=', 'internal'),
+                            ('quantity', '>', 0)
+                        ], limit=1)
+                        if quant:
+                            new_qty = min(new_qty, quant.quantity)
+                        if line.quantity != new_qty:
+                            _logger.info(
+                                "[DLOTS] Corrigiendo qty lote %s de %s a %s",
+                                lot.name, line.quantity, new_qty,
+                            )
+                            line.write({'quantity': new_qty})
+
+        # 4. Forzar actualización de cantidades
         return self.action_update_quantity_from_lines()
+
+    def _get_delivery_lot_qty(self, lot_id, full_qty, breakdown):
+        """
+        Determina la cantidad a asignar para un lote.
+        - formato/pieza: usa breakdown si existe, sino full_qty
+        - placa: siempre full_qty
+        """
+        lot = self.env['stock.lot'].browse(lot_id)
+        if not lot.exists():
+            return full_qty
+
+        tipo = (lot.x_tipo or 'placa').lower()
+        if tipo not in ('formato', 'pieza'):
+            return full_qty
+
+        lot_id_str = str(lot_id)
+        if lot_id_str in breakdown:
+            partial_qty = float(breakdown[lot_id_str])
+            return min(partial_qty, full_qty) if full_qty > 0 else partial_qty
+
+        return full_qty
 
     def action_update_quantity_from_lines(self):
         self.ensure_one()
@@ -502,6 +560,19 @@ export class DeliveryLotsButton extends Component {
                 { limit: lotIds.length }
             );
 
+            // Cargar quants para saber disponible real
+            const quantsData = await this.orm.searchRead(
+                "stock.quant",
+                [["lot_id", "in", lotIds], ["location_id.usage", "=", "internal"], ["quantity", ">", 0]],
+                ["lot_id", "quantity"],
+                { limit: lotIds.length * 2 }
+            );
+            const availQtyMap = {};
+            for (const q of quantsData) {
+                const lid = q.lot_id[0];
+                availQtyMap[lid] = (availQtyMap[lid] || 0) + q.quantity;
+            }
+
             const lotMap = Object.fromEntries(lotsData.map((l) => [l.id, l]));
             const qtyMap = Object.fromEntries(moveLineData.map((d) => [d.lotId, d.qty]));
             const locMap = Object.fromEntries(moveLineData.map((d) => [d.lotId, d.locationName]));
@@ -511,9 +582,27 @@ export class DeliveryLotsButton extends Component {
             for (const lotId of lotIds) {
                 const lot = lotMap[lotId];
                 if (!lot) continue;
-                const qty = qtyMap[lotId] || 0;
+                const assignedQty = qtyMap[lotId] || 0;
+                const availQty = availQtyMap[lotId] || 0;
                 const loc = (locMap[lotId] || "").split("/").pop();
-                totalQty += qty;
+                const tipo = (lot.x_tipo || "placa").toLowerCase();
+                const isPartial = (tipo === "formato" || tipo === "pieza");
+                const qtyLabel = tipo === "pieza" ? "pzas" : "m²";
+                const inputStep = tipo === "pieza" ? "1" : "0.01";
+
+                totalQty += assignedQty;
+
+                let qtyCell;
+                if (isPartial) {
+                    qtyCell = `
+                        <input type="number" class="dlots-qty-input"
+                               data-lot-id="${lotId}" data-max="${availQty}"
+                               step="${inputStep}" min="0" max="${availQty}"
+                               value="${assignedQty}" />
+                        <span class="dlots-qty-avail text-muted">/ ${availQty.toFixed(2)} ${qtyLabel}</span>`;
+                } else {
+                    qtyCell = `<span class="fw-semibold">${assignedQty.toFixed(2)} m²</span>`;
+                }
 
                 rows += `
                     <tr data-lot-row="${lotId}">
@@ -524,8 +613,10 @@ export class DeliveryLotsButton extends Component {
                         <td class="col-num">${lot.x_alto ? lot.x_alto.toFixed(0) : "-"}</td>
                         <td class="col-num">${lot.x_ancho ? lot.x_ancho.toFixed(0) : "-"}</td>
                         <td class="col-num">${lot.x_grosor || "-"}</td>
-                        <td class="col-num fw-semibold">${qty.toFixed(2)}</td>
-                        <td>${lot.x_tipo || "-"}</td>
+                        <td>
+                            <span class="dlots-tag dlots-tag-tipo-${tipo}">${tipo.charAt(0).toUpperCase() + tipo.slice(1)}</span>
+                        </td>
+                        <td class="col-num col-qty-inline">${qtyCell}</td>
                         <td>${lot.x_color || "-"}</td>
                         <td class="text-muted">${loc || "-"}</td>
                         <td class="text-muted dlots-font-mono">${lot.x_pedimento || "-"}</td>
@@ -553,8 +644,8 @@ export class DeliveryLotsButton extends Component {
                             <th class="col-num">Alto</th>
                             <th class="col-num">Ancho</th>
                             <th class="col-num">Esp.</th>
-                            <th class="col-num">M²</th>
                             <th>Tipo</th>
+                            <th class="col-num col-qty-inline">Cantidad</th>
                             <th>Color</th>
                             <th>Ubicación</th>
                             <th>Pedimento</th>
@@ -565,15 +656,16 @@ export class DeliveryLotsButton extends Component {
                     <tbody>${rows}</tbody>
                     <tfoot>
                         <tr class="dlots-total-row">
-                            <td colspan="7" class="text-end fw-bold text-muted">
+                            <td colspan="8" class="text-end fw-bold text-muted">
                                 Total (<span class="dlots-total-count">${lotIds.length}</span> placa${lotIds.length !== 1 ? "s" : ""}):
                             </td>
                             <td class="col-num fw-bold dlots-total-qty">${totalQty.toFixed(2)}</td>
-                            <td colspan="6"></td>
+                            <td colspan="5"></td>
                         </tr>
                     </tfoot>
                 </table>`;
 
+            // Botones quitar
             container.querySelectorAll(".dlots-remove-btn").forEach((btn) => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
@@ -581,10 +673,70 @@ export class DeliveryLotsButton extends Component {
                     await this.removeLot(parseInt(btn.dataset.lotId));
                 });
             });
+
+            // Inputs de cantidad parcial inline
+            container.querySelectorAll(".dlots-qty-input").forEach((input) => {
+                let debounceTimer = null;
+                const handler = () => {
+                    if (debounceTimer) clearTimeout(debounceTimer);
+                    debounceTimer = setTimeout(() => {
+                        this._onInlineQtyChange(input);
+                    }, 600);
+                };
+                input.addEventListener("input", handler);
+                input.addEventListener("blur", () => {
+                    if (debounceTimer) clearTimeout(debounceTimer);
+                    this._onInlineQtyChange(input);
+                });
+            });
+
         } catch (err) {
             console.error("[DLOTS] Error renderizando tabla:", err);
             container.innerHTML = `<div class="text-danger p-2"><i class="fa fa-exclamation-triangle me-2"></i>Error: ${err.message}</div>`;
         }
+    }
+
+    async _onInlineQtyChange(input) {
+        const lotId = parseInt(input.dataset.lotId);
+        const maxQty = parseFloat(input.dataset.max) || 0;
+        let val = parseFloat(input.value) || 0;
+        if (val < 0) val = 0;
+        if (val > maxQty) val = maxQty;
+        input.value = val;
+
+        const moveId = this.getMoveId();
+        if (!moveId) return;
+
+        // Obtener todos los lotes actuales y construir breakdown solo con este cambio
+        const currentData = await this._loadCurrentLotData();
+        const allLotIds = currentData.map((d) => d.lotId);
+        const breakdown = {};
+        breakdown[String(lotId)] = val;
+
+        try {
+            await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, allLotIds, breakdown]);
+            this._recalcInlineTotal();
+        } catch (err) {
+            console.error("[DLOTS] Error guardando qty parcial:", err);
+        }
+    }
+
+    _recalcInlineTotal() {
+        if (!this._detailsRow) return;
+        const totalEl = this._detailsRow.querySelector(".dlots-total-qty");
+        if (!totalEl) return;
+
+        let total = 0;
+        // Sumar inputs parciales
+        this._detailsRow.querySelectorAll(".dlots-qty-input").forEach((inp) => {
+            total += parseFloat(inp.value) || 0;
+        });
+        // Sumar placas completas (sin input)
+        this._detailsRow.querySelectorAll("td.col-qty-inline .fw-semibold").forEach((span) => {
+            const m = span.textContent.match(/([\d.]+)/);
+            if (m) total += parseFloat(m[1]) || 0;
+        });
+        totalEl.textContent = total.toFixed(2);
     }
 
     async removeLot(lotId) {
@@ -653,7 +805,13 @@ export class DeliveryLotsButton extends Component {
         const PAGE_SIZE = 35;
         const moveId = this.getMoveId();
 
-        const currentLotIds = await this._getCurrentLotIds();
+        // Cargar lotes actuales y sus cantidades asignadas
+        const currentLotData = await this._loadCurrentLotData();
+        const currentLotIds = currentLotData.map((d) => d.lotId);
+        const currentQtyMap = {};
+        for (const d of currentLotData) {
+            currentQtyMap[String(d.lotId)] = d.qty;
+        }
 
         const state = {
             quants: [],
@@ -663,6 +821,7 @@ export class DeliveryLotsButton extends Component {
             isLoadingMore: false,
             page: 0,
             pendingIds: new Set(currentLotIds),
+            pendingBreakdown: { ...currentQtyMap }, // Inicializar con cantidades actuales
             filters: { lot_name: "", bloque: "", atado: "", alto_min: "", ancho_min: "" },
         };
 
@@ -763,53 +922,27 @@ export class DeliveryLotsButton extends Component {
             footerInfo.innerHTML = `Mostrando <strong>${state.quants.length}</strong> de <strong>${state.totalCount}</strong>`;
         };
 
-        // ─── Seleccionar todo (visibles/cargadas) ────────────────────────────
+        // ─── Seleccionar todo ────────────────────────────────────────────────
         const doSelectAll = () => {
             for (const q of state.quants) {
                 const lotId = q.lot_id ? q.lot_id[0] : 0;
-                if (lotId) state.pendingIds.add(lotId);
+                if (!lotId) continue;
+                state.pendingIds.add(lotId);
+                const tipo = (q.x_tipo || "placa").toLowerCase();
+                if ((tipo === "formato" || tipo === "pieza") && state.pendingBreakdown[String(lotId)] === undefined) {
+                    state.pendingBreakdown[String(lotId)] = q.quantity || 0;
+                }
             }
             updateBadge();
-            body.querySelectorAll("tr[data-lot-id]").forEach((tr) => {
-                const lotId = parseInt(tr.dataset.lotId);
-                if (!lotId) return;
-                tr.className = "row-sel";
-                const chk = tr.querySelector(".dlots-chkbox");
-                if (chk) {
-                    chk.className = "dlots-chkbox checked";
-                    chk.innerHTML = '<i class="fa fa-check"></i>';
-                }
-                const tag = tr.querySelector(".dlots-tag");
-                if (tag) {
-                    tag.className = "dlots-tag dlots-tag-ok";
-                    tag.textContent = "Selec.";
-                }
-            });
+            renderTable();
         };
 
         // ─── Borrar selección ────────────────────────────────────────────────
         const doClearAll = () => {
             state.pendingIds.clear();
+            state.pendingBreakdown = {};
             updateBadge();
-            body.querySelectorAll("tr[data-lot-id]").forEach((tr) => {
-                tr.className = "";
-                const chk = tr.querySelector(".dlots-chkbox");
-                if (chk) {
-                    chk.className = "dlots-chkbox";
-                    chk.innerHTML = "";
-                }
-                const tag = tr.querySelector(".dlots-tag");
-                if (tag) {
-                    const reserved = tr.dataset.reserved === "1";
-                    if (reserved) {
-                        tag.className = "dlots-tag dlots-tag-warn";
-                        tag.textContent = "Reservado";
-                    } else {
-                        tag.className = "dlots-tag dlots-tag-free";
-                        tag.textContent = "Libre";
-                    }
-                }
-            });
+            renderTable();
         };
 
         const renderTable = () => {
@@ -830,13 +963,40 @@ export class DeliveryLotsButton extends Component {
                 const loc = q.location_id ? q.location_id[1].split("/").pop() : "-";
                 const sel = state.pendingIds.has(lotId);
                 const reserved = q.reserved_quantity > 0;
+                const tipo = (q.x_tipo || "placa").toLowerCase();
+                const isPartial = (tipo === "formato" || tipo === "pieza");
+                const lotIdStr = String(lotId);
+                const qtyLabel = tipo === "pieza" ? "pzas" : "m²";
+                const inputStep = tipo === "pieza" ? "1" : "0.01";
 
-                let statusBadge = `<span class="dlots-tag dlots-tag-free">Libre</span>`;
-                if (sel) statusBadge = `<span class="dlots-tag dlots-tag-ok">Selec.</span>`;
-                else if (reserved) statusBadge = `<span class="dlots-tag dlots-tag-warn">Reservado</span>`;
+                let statusBadge;
+                if (sel) {
+                    statusBadge = `<span class="dlots-tag dlots-tag-ok">Selec.</span>`;
+                } else if (reserved) {
+                    statusBadge = `<span class="dlots-tag dlots-tag-warn">Reservado</span>`;
+                } else {
+                    statusBadge = `<span class="dlots-tag dlots-tag-free">Libre</span>`;
+                }
+
+                const tipoLabel = tipo.charAt(0).toUpperCase() + tipo.slice(1);
+
+                let qtyCell;
+                if (isPartial && sel) {
+                    const currentVal = state.pendingBreakdown[lotIdStr] !== undefined
+                        ? state.pendingBreakdown[lotIdStr]
+                        : q.quantity;
+                    qtyCell = `<input type="number" class="dlots-popup-qty-input"
+                                     data-lot-id="${lotId}" data-max="${q.quantity}"
+                                     step="${inputStep}" min="0" max="${q.quantity}"
+                                     value="${currentVal}" />`;
+                } else if (isPartial && !sel) {
+                    qtyCell = `<span class="text-muted">—</span>`;
+                } else {
+                    qtyCell = `<span>${q.quantity ? q.quantity.toFixed(2) : "-"} ${qtyLabel}</span>`;
+                }
 
                 rows += `
-                    <tr class="${sel ? "row-sel" : ""}" data-lot-id="${lotId}" data-reserved="${reserved ? "1" : "0"}">
+                    <tr class="${sel ? "row-sel" : ""}" data-lot-id="${lotId}" data-reserved="${reserved ? "1" : "0"}" data-tipo="${tipo}">
                         <td class="col-chk">
                             <div class="dlots-chkbox ${sel ? "checked" : ""}">
                                 ${sel ? '<i class="fa fa-check"></i>' : ""}
@@ -849,7 +1009,8 @@ export class DeliveryLotsButton extends Component {
                         <td class="col-num">${q.x_ancho ? q.x_ancho.toFixed(0) : "-"}</td>
                         <td class="col-num">${q.x_grosor || "-"}</td>
                         <td class="col-num fw-semibold">${q.quantity ? q.quantity.toFixed(2) : "-"}</td>
-                        <td>${q.x_tipo || "-"}</td>
+                        <td><span class="dlots-tag dlots-tag-tipo-${tipo}">${tipoLabel}</span></td>
+                        <td class="col-num col-popup-qty">${qtyCell}</td>
                         <td>${q.x_color || "-"}</td>
                         <td class="cell-loc">${loc}</td>
                         <td>${statusBadge}</td>
@@ -873,8 +1034,9 @@ export class DeliveryLotsButton extends Component {
                             <th class="col-num">Alto</th>
                             <th class="col-num">Ancho</th>
                             <th class="col-num">Gros.</th>
-                            <th class="col-num">M²</th>
+                            <th class="col-num">Disponible</th>
                             <th>Tipo</th>
+                            <th class="col-num">A entregar</th>
                             <th>Color</th>
                             <th>Ubicación</th>
                             <th>Estado</th>
@@ -886,35 +1048,44 @@ export class DeliveryLotsButton extends Component {
 
             updateStats();
 
+            // Click en filas (toggle selección)
             body.querySelectorAll("tr[data-lot-id]").forEach((tr) => {
                 tr.style.cursor = "pointer";
-                tr.addEventListener("click", () => {
+                tr.addEventListener("click", (ev) => {
+                    if (ev.target.closest(".dlots-popup-qty-input")) return;
+
                     const lotId = parseInt(tr.dataset.lotId);
                     if (!lotId) return;
+                    const tipo = tr.dataset.tipo || "placa";
+                    const isPartial = (tipo === "formato" || tipo === "pieza");
+
                     if (state.pendingIds.has(lotId)) {
                         state.pendingIds.delete(lotId);
+                        delete state.pendingBreakdown[String(lotId)];
                     } else {
                         state.pendingIds.add(lotId);
-                    }
-                    const sel = state.pendingIds.has(lotId);
-                    tr.className = sel ? "row-sel" : "";
-                    const chk = tr.querySelector(".dlots-chkbox");
-                    if (chk) {
-                        chk.className = "dlots-chkbox" + (sel ? " checked" : "");
-                        chk.innerHTML = sel ? '<i class="fa fa-check"></i>' : "";
-                    }
-                    const tag = tr.querySelector(".dlots-tag");
-                    if (tag) {
-                        if (sel) {
-                            tag.className = "dlots-tag dlots-tag-ok";
-                            tag.textContent = "Selec.";
-                        } else {
-                            const reserved = tr.dataset.reserved === "1";
-                            tag.className = reserved ? "dlots-tag dlots-tag-warn" : "dlots-tag dlots-tag-free";
-                            tag.textContent = reserved ? "Reservado" : "Libre";
+                        if (isPartial) {
+                            const q = state.quants.find(qq => qq.lot_id && qq.lot_id[0] === lotId);
+                            if (q) {
+                                state.pendingBreakdown[String(lotId)] = q.quantity || 0;
+                            }
                         }
                     }
                     updateBadge();
+                    renderTable();
+                });
+            });
+
+            // Inputs de cantidad parcial en popup
+            body.querySelectorAll(".dlots-popup-qty-input").forEach((input) => {
+                input.addEventListener("click", (e) => e.stopPropagation());
+                input.addEventListener("input", () => {
+                    const lotId = parseInt(input.dataset.lotId);
+                    const max = parseFloat(input.dataset.max) || 0;
+                    let val = parseFloat(input.value) || 0;
+                    if (val < 0) val = 0;
+                    if (val > max) { val = max; input.value = val; }
+                    state.pendingBreakdown[String(lotId)] = val;
                 });
             });
 
@@ -1000,7 +1171,26 @@ export class DeliveryLotsButton extends Component {
 
             try {
                 const finalLotIds = Array.from(state.pendingIds);
-                await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, finalLotIds]);
+
+                // Construir breakdown limpio: solo formato/pieza seleccionados
+                const cleanBreakdown = {};
+                for (const [k, v] of Object.entries(state.pendingBreakdown)) {
+                    if (state.pendingIds.has(parseInt(k))) {
+                        // Solo incluir si es formato/pieza (verificar en quants)
+                        const q = state.quants.find(qq => qq.lot_id && qq.lot_id[0] === parseInt(k));
+                        if (q) {
+                            const tipo = (q.x_tipo || "placa").toLowerCase();
+                            if (tipo === "formato" || tipo === "pieza") {
+                                cleanBreakdown[k] = v;
+                            }
+                        } else {
+                            // Lote no está en quants cargados (paginación), incluir por si acaso
+                            cleanBreakdown[k] = v;
+                        }
+                    }
+                }
+
+                await this.orm.call("stock.move", "action_set_delivery_lots", [moveId, finalLotIds, cleanBreakdown]);
                 await this._syncOdooState();
             } catch (err) {
                 console.error("[DLOTS] Error confirmando selección:", err);
@@ -1272,6 +1462,7 @@ $dl-radius-sm:     5px;
 
         &.col-num { text-align: right; }
         &.col-act { text-align: center; width: 36px; }
+        &.col-qty-inline { text-align: right; width: 160px; }
         &.text-center { text-align: center; }
     }
 
@@ -1288,6 +1479,7 @@ $dl-radius-sm:     5px;
 
         &.col-num { text-align: right; font-variant-numeric: tabular-nums; }
         &.col-act { text-align: center; }
+        &.col-qty-inline { text-align: right; }
         &.text-center { text-align: center; }
     }
 
@@ -1334,6 +1526,79 @@ $dl-radius-sm:     5px;
     }
 
     i { font-size: 10px; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUT DE CANTIDAD PARCIAL (formato/pieza) — inline + popup
+// ═══════════════════════════════════════════════════════════════════════════
+.dlots-qty-input,
+.dlots-popup-qty-input {
+    width: 80px;
+    padding: 3px 6px;
+    border: 1.5px solid $dl-border;
+    border-radius: $dl-radius-sm;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: right;
+    color: $dl-text;
+    background: white;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    font-variant-numeric: tabular-nums;
+
+    &:focus {
+        outline: none;
+        border-color: $dl-primary-light;
+        box-shadow: 0 0 0 2px rgba($dl-primary-light, 0.2);
+    }
+
+    &:hover {
+        border-color: #a0aec0;
+    }
+
+    &::-webkit-outer-spin-button,
+    &::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+    }
+    -moz-appearance: textfield;
+}
+
+.dlots-qty-avail {
+    font-size: 10px;
+    margin-left: 4px;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TAGS DE TIPO (Placa / Formato / Pieza)
+// ═══════════════════════════════════════════════════════════════════════════
+.dlots-tag-tipo-placa {
+    background: #e2e8f0;
+    color: #4a5568;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.dlots-tag-tipo-formato {
+    background: #fefcbf;
+    color: #744210;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.dlots-tag-tipo-pieza {
+    background: #bee3f8;
+    color: #2a4365;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
 }
 
 // ── POPUP fullscreen ──────────────────────────────────────────────────────
@@ -1588,7 +1853,7 @@ $dl-radius-sm:     5px;
         &.row-sel {
             background: #ebfaf1;
             &:hover { background: #d4f4e0; }
-            td:first-child { border-left: 3px solid $dl-accent; }
+            td:first-child { box-shadow: inset 3px 0 0 0 $dl-accent; }
         }
 
         td {
@@ -1600,11 +1865,20 @@ $dl-radius-sm:     5px;
             &.col-chk { text-align: center; width: 44px; }
             &.col-num { text-align: right; font-variant-numeric: tabular-nums; }
 
+            &.col-popup-qty {
+                text-align: right;
+                min-width: 100px;
+                overflow: visible;
+            }
+
             &.cell-lot {
                 font-family: 'Courier New', monospace;
                 font-size: 11.5px;
                 font-weight: 700;
                 color: $dl-primary;
+                overflow: visible;
+                text-overflow: unset;
+                min-width: 140px;
             }
 
             &.cell-loc { color: $dl-muted; font-size: 11px; }
@@ -1689,11 +1963,7 @@ $dl-radius-sm:     5px;
     align-items: center;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ESTILOS ADICIONALES: Agregar al final de delivery_lots_styles.scss
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Botones Seleccionar todo / Borrar selección en filtros del popup
+// Botones Seleccionar todo / Borrar selección
 .dlots-filter-actions {
     display: flex;
     align-items: flex-end;
