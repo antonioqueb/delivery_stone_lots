@@ -411,7 +411,7 @@ export class DeliveryLotsButton extends Component {
                             <th>Atado</th>
                             <th>Grupo</th>
                             <th class="col-num">Alto</th>
-                            <th class="col-num">Ancho</th>
+                            <th class="col-num">Largo</th>
                             <th class="col-num">Esp.</th>
                             <th>Tipo</th>
                             <th class="col-num col-qty-inline">Cantidad</th>
@@ -680,7 +680,7 @@ export class DeliveryLotsButton extends Component {
                         </div>
 
                         <div class="dlots-filter-group">
-                            <label>Ancho mín.</label>
+                            <label>Largo mín.</label>
                             <input type="number" class="dlots-filter-input dlots-filter-sm" id="df-ancho" placeholder="0" step="0.01"/>
                         </div>
 
@@ -979,7 +979,7 @@ export class DeliveryLotsButton extends Component {
                             <th>Bloque</th>
                             <th>Atado</th>
                             <th class="col-num">Alto</th>
-                            <th class="col-num">Ancho</th>
+                            <th class="col-num">Largo</th>
                             <th class="col-num">Esp.</th>
                             <th class="col-num">Disponible</th>
                             <th>Tipo</th>
