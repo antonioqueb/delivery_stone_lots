@@ -42,6 +42,9 @@ class StockMove(models.Model):
             ('product_id', '=', self.product_id.id),
             ('quantity', '>', 0),
         ]
+        # Multiempresa: solo stock de la compañía del movimiento
+        if self.company_id:
+            domain.append(('company_id', '=', self.company_id.id))
 
         quant = self.env['stock.quant'].search(
             domain + [('location_id', 'child_of', self.location_id.id)],

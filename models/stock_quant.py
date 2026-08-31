@@ -155,6 +155,13 @@ class StockQuantDelivery(models.Model):
             ('quantity', '>', 0),
         ]
 
+        # Multiempresa: inventario de la compañía de la ENTREGA (move), no
+        # de todas las seleccionadas en el switcher.
+        if move_id:
+            move_company = self.env['stock.move'].browse(int(move_id)).company_id
+            if move_company:
+                domain.append(('company_id', '=', move_company.id))
+
         if excluded_lot_ids:
             domain.append(('lot_id', 'not in', excluded_lot_ids))
 

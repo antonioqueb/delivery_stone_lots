@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Delivery Stone Lots Viewer',
-    'version': '19.0.2.0.0',
+    'version': '19.0.2.1.0',
     'category': 'Inventory',
     'summary': 'Visualización y gestión de lotes (placas) en albarán de entrega',
     'author': 'Alphaqueb Consulting SAS',
